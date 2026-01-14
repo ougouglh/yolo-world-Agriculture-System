@@ -141,7 +141,7 @@ def create_chunks(disease: Dict) -> List[Dict]:
 def build_vectorstore(
     json_path: str,
     persist_dir: str,
-    collection_name: str = "plant_disease_knowledge",
+    collection_name: str = "knowledge_base/disease_knowledge_base.json",
     embedding_model: str = "BAAI/bge-base-zh-v1.5"
 ):
     """
