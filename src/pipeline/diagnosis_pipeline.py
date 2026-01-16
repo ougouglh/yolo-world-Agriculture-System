@@ -1,13 +1,20 @@
 """
 完整诊断流程
 整合 YOLO-World 检测 + RAG 检索 + LLM 生成
+路径: src/pipeline/diagnosis_pipeline.py
+
+优化内容：
+- 新增进度回调支持
+- 新增 ConversationalDiagnosisPipeline 支持多轮对话追问
 """
 
 import sys
 import os
 from pathlib import Path
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Callable
 import logging
+from http import HTTPStatus
+import dashscope
 from ultralytics import YOLO
 from PIL import Image
 import numpy as np
@@ -192,7 +199,8 @@ class PlantDiseaseDiagnosisPipeline:
             self,
             image_path: str,
             retrieve_top_k: int = 3,
-            return_annotated_image: bool = True
+            return_annotated_image: bool = True,
+            progress_callback: Optional[Callable[[str], None]] = None
     ) -> Dict:
         """
         完整诊断流程
@@ -201,6 +209,7 @@ class PlantDiseaseDiagnosisPipeline:
             image_path: 图像路径
             retrieve_top_k: 检索文档数量
             return_annotated_image: 是否返回标注图像
+            progress_callback: 进度回调函数 (新增)
 
         Returns:
             完整诊断结果字典
@@ -222,6 +231,9 @@ class PlantDiseaseDiagnosisPipeline:
 
         try:
             # 步骤 1: 病害检测
+            if progress_callback:
+                progress_callback("正在检测病害...")
+
             logger.info("\n[步骤 1/3] 执行病害检测...")
             detections, annotated_image = self.detect_diseases(image_path)
             result['detections'] = detections
@@ -241,6 +253,9 @@ class PlantDiseaseDiagnosisPipeline:
             logger.info(f"检测到 {len(disease_names)} 种病害: {', '.join(disease_names)}")
 
             # 步骤 2: 知识检索
+            if progress_callback:
+                progress_callback("正在检索知识库...")
+
             logger.info("\n[步骤 2/3] 检索知识库...")
             retrieval_results, context = self.retrieve_knowledge(
                 disease_names=disease_names,
@@ -249,6 +264,9 @@ class PlantDiseaseDiagnosisPipeline:
             result['knowledge_retrieval'] = retrieval_results
 
             # 步骤 3: 生成报告
+            if progress_callback:
+                progress_callback("正在生成诊断报告...")
+
             logger.info("\n[步骤 3/3] 生成诊断报告...")
             report_result = self.generate_report(
                 disease_names=disease_names,
@@ -260,6 +278,8 @@ class PlantDiseaseDiagnosisPipeline:
             result['success'] = report_result.get('success', False)
 
             if result['success']:
+                if progress_callback:
+                    progress_callback("诊断完成！")
                 logger.info("\n" + "=" * 60)
                 logger.info("🎉 诊断完成！")
                 logger.info("=" * 60)
@@ -273,6 +293,123 @@ class PlantDiseaseDiagnosisPipeline:
             result['error'] = str(e)
             return result
 
+    def get_statistics(self) -> Dict:
+        """获取向量库统计信息"""
+        return self.retriever.get_statistics()
+
+
+class ConversationalDiagnosisPipeline(PlantDiseaseDiagnosisPipeline):
+    """
+    支持多轮对话的诊断流程（新增功能）
+
+    继承自 PlantDiseaseDiagnosisPipeline，增加：
+    - 对话历史管理
+    - 追问功能
+    - 上下文保持
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.conversation_history = []
+        self.last_context = ""
+        self.last_disease_names = []
+
+    def diagnose(self, *args, **kwargs) -> Dict:
+        """重写诊断方法，保存上下文供追问使用"""
+        result = super().diagnose(*args, **kwargs)
+
+        # 保存上下文
+        if result.get('knowledge_retrieval'):
+            self.last_context = self.retriever.format_context(
+                result['knowledge_retrieval'],
+                max_length=2000
+            )
+
+        if result.get('disease_names'):
+            self.last_disease_names = result['disease_names']
+
+        # 清空之前的对话历史（新的诊断开始新对话）
+        self.conversation_history = []
+
+        return result
+
+    def ask_followup(self, question: str, additional_context: str = "") -> str:
+        """
+        追问功能 - 基于之前的诊断结果回答问题
+
+        Args:
+            question: 用户追问问题
+            additional_context: 额外上下文（可选）
+
+        Returns:
+            回答文本
+        """
+        if not question.strip():
+            return "请输入您的问题"
+
+        # 构建历史对话
+        history_str = ""
+        if self.conversation_history:
+            history_str = "\n".join([
+                f"用户: {h['user']}\n助手: {h['assistant']}"
+                for h in self.conversation_history[-3:]  # 最近3轮
+            ])
+
+        # 合并上下文
+        context = additional_context or self.last_context
+
+        # 病害信息
+        disease_info = ""
+        if self.last_disease_names:
+            disease_info = f"当前诊断的病害: {', '.join(self.last_disease_names)}"
+
+        # 构建追问 prompt
+        prompt = f"""你是农业病害诊断专家。用户之前对作物进行了病害诊断，现在有追问。
+
+{disease_info}
+
+之前的对话：
+{history_str}
+
+相关知识库信息：
+{context}
+
+用户追问：{question}
+
+请专业、清晰、简洁地回答。如果问题与之前的诊断相关，请基于诊断结果回答；如果是新问题，请给出专业建议。"""
+
+        try:
+            response = dashscope.Generation.call(
+                model=self.generator.model,
+                prompt=prompt,
+                max_tokens=1000,
+                temperature=0.7,
+                result_format='message'
+            )
+
+            if response.status_code == HTTPStatus.OK:
+                answer = response.output.choices[0].message.content
+
+                # 保存到对话历史
+                self.conversation_history.append({
+                    "user": question,
+                    "assistant": answer
+                })
+
+                return answer
+            else:
+                return f"回答失败: {response.message}"
+
+        except Exception as e:
+            logger.error(f"追问回答失败: {e}")
+            return f"回答失败: {str(e)}"
+
+    def clear_history(self):
+        """清空对话历史"""
+        self.conversation_history = []
+        self.last_context = ""
+        self.last_disease_names = []
+
 
 def test_pipeline():
     """测试完整诊断流程"""
@@ -285,11 +422,11 @@ def test_pipeline():
     vectorstore_path = "./vectorstore/chroma_db"
     api_key = "sk-26d1261b1bd44fae92985f4cdee517e5"
 
-    # 测试图像路径（你需要替换为实际的测试图像）
+    # 测试图像路径
     test_image = "/root/autodl-tmp/project/dataset/images/test_zeroshot/Tomato_Tomato_Yellow_Leaf_Curl_Virus_5350.jpg"
 
-    # 初始化流程
-    pipeline = PlantDiseaseDiagnosisPipeline(
+    # 使用支持对话的 Pipeline
+    pipeline = ConversationalDiagnosisPipeline(
         yolo_model_path=yolo_model_path,
         vectorstore_path=vectorstore_path,
         api_key=api_key,
@@ -324,6 +461,20 @@ def test_pipeline():
         if 'token_usage' in result['diagnosis_report']:
             usage = result['diagnosis_report']['token_usage']
             print(f"\nToken 使用: {usage['total_tokens']} tokens")
+
+        # 测试追问功能
+        print("\n" + "=" * 60)
+        print("测试追问功能")
+        print("=" * 60)
+
+        answer = pipeline.ask_followup("这种病害在什么季节最容易发生？")
+        print(f"\n追问: 这种病害在什么季节最容易发生？")
+        print(f"回答: {answer}")
+
+        answer2 = pipeline.ask_followup("有没有生物防治的方法？")
+        print(f"\n追问: 有没有生物防治的方法？")
+        print(f"回答: {answer2}")
+
     else:
         print(f"\n❌ 诊断失败: {result.get('error', '未知错误')}")
 
